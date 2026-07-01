@@ -6,8 +6,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <errno.h>
 
 #define CPKG_VERSION "0.1.0"
+#define CPKG_PATH_MAX 4096
 
 static void print_usage(const char *prog) {
     fprintf(stderr, "cpkg v%s - C Package Manager\n", CPKG_VERSION);
@@ -17,7 +19,164 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  %s run [args...]      build and run the project\n", prog);
     fprintf(stderr, "  %s add <git-url>      add a dependency\n", prog);
     fprintf(stderr, "  %s install            install all dependencies\n", prog);
+    fprintf(stderr, "  %s project install    build and install the project\n", prog);
     fprintf(stderr, "  %s help               show this help\n", prog);
+}
+
+static int mkdir_p(const char *path) {
+    char tmp[CPKG_PATH_MAX];
+    if (snprintf(tmp, sizeof(tmp), "%s", path) >= (int)sizeof(tmp)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    size_t len = strlen(tmp);
+    if (len == 0) return -1;
+    if (len > 1 && tmp[len - 1] == '/') tmp[len - 1] = '\0';
+
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
+            *p = '/';
+        }
+    }
+
+    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
+    return 0;
+}
+
+static int copy_file(const char *src, const char *dst) {
+    FILE *in = fopen(src, "rb");
+    if (!in) {
+        fprintf(stderr, "error: cannot open '%s'\n", src);
+        return -1;
+    }
+
+    FILE *out = fopen(dst, "wb");
+    if (!out) {
+        fprintf(stderr, "error: cannot write '%s'\n", dst);
+        fclose(in);
+        return -1;
+    }
+
+    char buf[8192];
+    size_t n;
+    int ret = 0;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            fprintf(stderr, "error: failed writing '%s'\n", dst);
+            ret = -1;
+            break;
+        }
+    }
+
+    if (ferror(in)) {
+        fprintf(stderr, "error: failed reading '%s'\n", src);
+        ret = -1;
+    }
+
+    if (fclose(out) != 0) {
+        fprintf(stderr, "error: failed closing '%s'\n", dst);
+        ret = -1;
+    }
+    fclose(in);
+
+    if (ret == 0 && chmod(dst, 0755) != 0) {
+        fprintf(stderr, "error: failed to mark '%s' executable\n", dst);
+        ret = -1;
+    }
+
+    return ret;
+}
+
+static const char *path_basename(const char *path) {
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+static int project_install(const char *prog, int argc, char **argv) {
+    const char *prefix = getenv("CPKG_PREFIX");
+    if (!prefix || !prefix[0]) prefix = getenv("PREFIX");
+    if (!prefix || !prefix[0]) prefix = "/usr/local";
+
+    const char *destdir = getenv("DESTDIR");
+    if (!destdir) destdir = "";
+
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--prefix") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "usage: %s project install [--prefix <dir>] [--destdir <dir>]\n", prog);
+                return 1;
+            }
+            prefix = argv[++i];
+        } else if (strcmp(argv[i], "--destdir") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "usage: %s project install [--prefix <dir>] [--destdir <dir>]\n", prog);
+                return 1;
+            }
+            destdir = argv[++i];
+        } else {
+            fprintf(stderr, "unknown option for project install: %s\n", argv[i]);
+            fprintf(stderr, "usage: %s project install [--prefix <dir>] [--destdir <dir>]\n", prog);
+            return 1;
+        }
+    }
+
+    manifest_t m;
+    if (manifest_load("cpkg.json", &m) != 0) return 1;
+
+    if (deps_install_all(&m) != 0) {
+        manifest_free(&m);
+        return 1;
+    }
+
+    if (build_project(&m, 0, 0, NULL) != 0) {
+        manifest_free(&m);
+        return 1;
+    }
+
+    char output_name[CPKG_PATH_MAX];
+    int n;
+    if (m.output) {
+        n = snprintf(output_name, sizeof(output_name), "%s", m.output);
+    } else {
+        n = snprintf(output_name, sizeof(output_name), "build/%s", m.name);
+    }
+    if (n < 0 || n >= (int)sizeof(output_name)) {
+        fprintf(stderr, "error: project output path is too long\n");
+        manifest_free(&m);
+        return 1;
+    }
+
+    char bin_dir[CPKG_PATH_MAX];
+    n = snprintf(bin_dir, sizeof(bin_dir), "%s%s/bin", destdir, prefix);
+    if (n < 0 || n >= (int)sizeof(bin_dir)) {
+        fprintf(stderr, "error: install directory path is too long\n");
+        manifest_free(&m);
+        return 1;
+    }
+    if (mkdir_p(bin_dir) != 0) {
+        fprintf(stderr, "error: failed to create install directory '%s'\n", bin_dir);
+        manifest_free(&m);
+        return 1;
+    }
+
+    char install_path[CPKG_PATH_MAX];
+    n = snprintf(install_path, sizeof(install_path), "%s/%s", bin_dir, path_basename(output_name));
+    if (n < 0 || n >= (int)sizeof(install_path)) {
+        fprintf(stderr, "error: install path is too long\n");
+        manifest_free(&m);
+        return 1;
+    }
+    if (copy_file(output_name, install_path) != 0) {
+        manifest_free(&m);
+        return 1;
+    }
+
+    printf("installed project '%s' to %s\n", m.name, install_path);
+    manifest_free(&m);
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -172,6 +331,13 @@ int main(int argc, char **argv) {
         int ret = deps_install_all(&m);
         manifest_free(&m);
         return ret != 0 ? 1 : 0;
+
+    } else if (strcmp(cmd, "project") == 0) {
+        if (argc >= 3 && strcmp(argv[2], "install") == 0) {
+            return project_install(argv[0], argc - 3, argv + 3);
+        }
+        fprintf(stderr, "usage: %s project install [--prefix <dir>] [--destdir <dir>]\n", argv[0]);
+        return 1;
 
     } else {
         fprintf(stderr, "unknown command: %s\n", cmd);
